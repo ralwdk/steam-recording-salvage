@@ -1,13 +1,13 @@
 import shutil
 import subprocess
 from pathlib import Path
-
+from typing import Optional
 
 class ExportError(RuntimeError):
     pass
 
 
-def resolve_ffmpeg(custom_path: Path | None) -> Path:
+def resolve_ffmpeg(custom_path: Optional[Path]) -> Path:
     # Prefer an explicit ffmpeg path if provided, otherwise fall back to PATH.
     if custom_path:
         ffmpeg = custom_path.expanduser()
@@ -26,7 +26,7 @@ def export_session(
     mpd_path: Path,
     output_mp4: Path,
     *,
-    ffmpeg_path: Path | None = None,
+    ffmpeg_path: Optional[Path] = None,
     overwrite: bool = False,
 ) -> None:
     mpd_path = mpd_path.expanduser().resolve()
