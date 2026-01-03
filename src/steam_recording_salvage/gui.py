@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QCheckBox,
     QSizePolicy,
+    QStyle,
 )
 
 from .scan import discover_sessions, find_sessions, RecordingSession
@@ -48,8 +49,8 @@ class MediaStats:
 
     def has_audio(self) -> Optional[bool]:
         # Slightly goofy helper, but it keeps the call sites readable:
-        # - None means “I genuinely don’t know yet”
-        # - True means “audio stream exists”
+        # None means “I genuinely don’t know yet”
+        # True means “audio stream exists”
         if self.acodec is None:
             return None
         return True
@@ -154,11 +155,25 @@ class MainWindow(QWidget):
         self.video_frame = QFrame()
         self.video_frame.setFrameShape(QFrame.StyledPanel)
         self.video_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.video_frame.setMinimumHeight(420)  # this is the big change: make preview feel “taller”
+        self.video_frame.setMinimumHeight(420)  # I like the preview feeling “taller”
 
         self.play_btn = QPushButton("Play")
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.setEnabled(False)
+
+        # Stop button ended up feeling kind of pointless here.
+        # We already have Play/Pause, scrubbing, and session switching resets playback anyway.
+        # So I’m swapping Stop for volume controls like a normal media player.
+        self.mute_btn = QPushButton()
+        self.mute_btn.setToolTip("Mute / unmute")
+
+        self.volume = QSlider(Qt.Horizontal)
+        self.volume.setRange(0, 100)
+        self.volume.setValue(100)
+        self.volume.setSingleStep(2)
+        self.volume.setPageStep(10)
+        self.volume.setToolTip("Volume")
+
+        # Remember last non-zero volume so mute/unmute behaves like you'd expect.
+        self._last_nonzero_volume: int = 100
 
         self.seek = QSlider(Qt.Horizontal)
         self.seek.setRange(0, 10_000)
@@ -204,21 +219,24 @@ class MainWindow(QWidget):
         # One timer loop to keep UI in sync with VLC.
         # We keep it smooth, but not “spammy”.
         self._tick = QTimer(self)
-        self._tick.setInterval(120)  # keep it smooth but not too spammy
+        self._tick.setInterval(120)
         self._tick.timeout.connect(self._on_tick)
         self._tick.start()
 
+        # Make sure the icon matches the default slider state right away.
+        self._refresh_volume_icon()
+        self._apply_volume_to_vlc()
+
     def _apply_compact_ui(self) -> None:
         # Smaller font so the minimum size can still look clean without overlaps.
-        # This is the “make small elements smaller so big elements can breathe” part.
         f = QFont()
-        f.setPointSize(12)  # you can tune this 11–12 if you want
+        f.setPointSize(12)
         self.setFont(f)
 
-        # Make buttons a bit tighter so they don’t hog vertical space.
+        # Keep buttons tight so the preview gets more space.
         for b in [
             self.play_btn,
-            self.stop_btn,
+            self.mute_btn,
             self.set_in_btn,
             self.set_out_btn,
             self.clear_trim_btn,
@@ -230,6 +248,13 @@ class MainWindow(QWidget):
 
         # Keep the seekbar slim so the preview gets more love.
         self.seek.setMinimumHeight(20)
+
+        # Compact volume control so it doesn't steal space from the seek bar.
+        self.volume.setMinimumHeight(20)
+        self.volume.setFixedWidth(140)
+
+        # Square-ish button so the icon looks clean.
+        self.mute_btn.setFixedWidth(36)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -249,7 +274,6 @@ class MainWindow(QWidget):
         out_row.addWidget(self.out_edit, 1)
         out_row.addWidget(self.browse_out_btn)
 
-        # Left side: Sessions (taller) + stats (near the bottom)
         left_col = QVBoxLayout()
         left_col.addWidget(QLabel("Sessions found"))
         left_col.addWidget(self.sessions_list, 1)
@@ -272,14 +296,14 @@ class MainWindow(QWidget):
         left_widget = QWidget()
         left_widget.setLayout(left_col)
 
-        # Right side: Preview + controls (below preview) + log
         right_col = QVBoxLayout()
         right_col.addWidget(QLabel("Preview"))
         right_col.addWidget(self.video_frame, 1)
 
         controls_row = QHBoxLayout()
         controls_row.addWidget(self.play_btn)
-        controls_row.addWidget(self.stop_btn)
+        controls_row.addWidget(self.mute_btn)
+        controls_row.addWidget(self.volume)
         controls_row.addWidget(self.seek, 1)
         controls_row.addWidget(self.time_lbl)
         right_col.addLayout(controls_row)
@@ -287,7 +311,6 @@ class MainWindow(QWidget):
         trim_row = QHBoxLayout()
         trim_row.addWidget(self.trim_lbl)
         trim_row.addStretch(1)
-        # Put Set In / Set Out in the middle like you asked
         trim_row.addWidget(self.set_in_btn)
         trim_row.addWidget(self.set_out_btn)
         trim_row.addWidget(self.clear_trim_btn)
@@ -303,7 +326,6 @@ class MainWindow(QWidget):
         right_widget = QWidget()
         right_widget.setLayout(right_col)
 
-        # Use a splitter so left vs right stays proportional when resizing.
         mid_split = QSplitter(Qt.Horizontal)
         mid_split.addWidget(left_widget)
         mid_split.addWidget(right_widget)
@@ -326,14 +348,15 @@ class MainWindow(QWidget):
         self.export_btn.clicked.connect(self._export_selected)
 
         self.play_btn.clicked.connect(self._toggle_play_pause)
-        self.stop_btn.clicked.connect(self._stop_preview)
 
-        # Seekbar scrubbing behaviour
+        # Volume controls are intentionally simple: slider sets the volume, button toggles mute.
+        self.volume.valueChanged.connect(self._on_volume_changed)
+        self.mute_btn.clicked.connect(self._toggle_mute)
+
         self.seek.sliderPressed.connect(self._on_slider_pressed)
         self.seek.sliderReleased.connect(self._on_slider_released)
         self.seek.valueChanged.connect(self._on_slider_value_changed)
 
-        # Trim controls
         self.set_in_btn.clicked.connect(self._set_trim_in)
         self.set_out_btn.clicked.connect(self._set_trim_out)
         self.clear_trim_btn.clicked.connect(self._clear_trim)
@@ -346,8 +369,6 @@ class MainWindow(QWidget):
             self.root_edit.setText(str(Path.home()))
 
         self.out_edit.setText(str(Path.home() / "Desktop"))
-
-        # Open at a sensible size. This becomes the minimum size due to showEvent().
         self.resize(1200, 760)
 
     def _choose_root(self) -> None:
@@ -432,7 +453,6 @@ class MainWindow(QWidget):
 
         self._attach_vlc_to_widget()
 
-        # MPD loads through VLC directly (nice because we don’t have to stitch segments manually here).
         media = self._vlc_instance.media_new(str(mpd))
         self._vlc_player.set_media(media)
 
@@ -441,59 +461,52 @@ class MainWindow(QWidget):
             self._log("VLC failed to start playback. (libVLC not found / VLC not installed?)")
             return
 
-        self.stop_btn.setEnabled(True)
         self.play_btn.setText("Pause")
         self._reached_end = False
+
+        # VLC sometimes resets audio when new media loads, so I just re-apply volume here.
+        self._apply_volume_to_vlc()
+
         self._log(f"Previewing: {mpd}")
 
     def _toggle_play_pause(self) -> None:
-        # One button that flips between Play and Pause, like a normal player.
         if self._vlc_player.is_playing():
             self._vlc_player.pause()
             self.play_btn.setText("Play")
             return
 
-        # If nothing is loaded yet, start preview.
         if self._current_session and self._vlc_player.get_media() is None:
             self._start_preview()
             return
 
-        # If VLC ended, Play should behave like a normal player and restart.
-        # (This prevents the “Play does nothing because VLC thinks it’s at EOF” vibe.)
         if self._reached_end:
             self._restart_and_seek(0, autoplay=True)
             return
 
         self._vlc_player.play()
         self.play_btn.setText("Pause")
-        self.stop_btn.setEnabled(True)
 
     def _stop_preview(self) -> None:
-        # Stop should fully reset the playback state.
+        # Still useful internally when switching sessions/roots.
         try:
             self._vlc_player.stop()
         except Exception:
             pass
 
-        self.stop_btn.setEnabled(False)
         self.play_btn.setText("Play")
 
         self._total_ms = 0
         self._reached_end = False
 
-        # Also reset seek-guard so we don’t get “stuck” thinking we’re mid-seek.
         self._seeking = False
         self._seek_target_ms = None
 
         self.time_lbl.setText("00:00 / 00:00")
 
     def _on_tick(self) -> None:
-        # This updates the seekbar and time display while playing.
-        # Important detail: if the user is scrubbing, we don’t fight them.
         if self._vlc_player.get_media() is None:
             return
 
-        # length can return -1 early on, so we only accept it if it’s legit.
         length = self._vlc_player.get_length()
         if length and length > 0:
             self._total_ms = length
@@ -503,13 +516,10 @@ class MainWindow(QWidget):
             cur = 0
 
         if self._is_scrubbing and self._pending_seek_ms is not None:
-            # While holding the slider, show the scrub time instead of snapping back.
             self.time_lbl.setText(f"{_format_time(self._pending_seek_ms)} / {_format_time(self._total_ms)}")
             return
 
         if self._seeking and self._seek_target_ms is not None:
-            # While VLC is landing, keep the label stable.
-            # (Otherwise it looks like it’s teleporting around.)
             self.time_lbl.setText(f"{_format_time(self._seek_target_ms)} / {_format_time(self._total_ms)}")
             return
 
@@ -522,11 +532,9 @@ class MainWindow(QWidget):
         self.time_lbl.setText(f"{_format_time(cur)} / {_format_time(self._total_ms)}")
 
     def _on_slider_pressed(self) -> None:
-        # Pause immediately so the video doesn't keep advancing underneath your scrub.
         self._is_scrubbing = True
         self._pending_seek_ms = self._slider_value_to_ms(self.seek.value())
 
-        # Remember if we were playing, so we can resume naturally when you release.
         try:
             self._was_playing_before_scrub = bool(self._vlc_player.is_playing())
         except Exception:
@@ -547,28 +555,21 @@ class MainWindow(QWidget):
             self.time_lbl.setText(f"{_format_time(self._pending_seek_ms)} / {_format_time(self._total_ms)}")
 
     def _on_slider_released(self) -> None:
-        # This is the change you asked for:
-        # If the video ended, scrubbing back should autoplay without needing you to hit Play.
         if self._pending_seek_ms is None:
             self._is_scrubbing = False
             return
 
         target = int(self._pending_seek_ms)
 
-        # If we’re in that “EOF dead zone”, we do the restart+seek revive routine.
         if self._reached_end:
             self._restart_and_seek(target, autoplay=True)
         else:
-            # Normal case: just seek and resume if we were playing.
             self._commit_seek(target, resume=self._was_playing_before_scrub)
 
         self._is_scrubbing = False
         self._pending_seek_ms = None
 
     def _commit_seek(self, target_ms: int, *, resume: bool) -> None:
-        # MPD seeks sometimes snap to the previous keyframe/segment boundary.
-        # We seek by position when we can (it tends to behave nicer for MPDs),
-        # then we "settle" for a moment and update the UI to the real landed time.
         self._seeking = True
         self._seek_target_ms = int(target_ms)
         self.time_lbl.setText(f"{_format_time(self._seek_target_ms)} / {_format_time(self._total_ms)}")
@@ -578,7 +579,6 @@ class MainWindow(QWidget):
                 pos = max(0.0, min(1.0, float(target_ms) / float(self._total_ms)))
                 self._vlc_player.set_position(pos)
             except Exception:
-                # Fallback: set_time also works sometimes, but it’s less reliable for MPD.
                 try:
                     self._vlc_player.set_time(int(target_ms))
                 except Exception:
@@ -589,12 +589,9 @@ class MainWindow(QWidget):
             except Exception:
                 pass
 
-        # Let VLC land, then we pick up the real time and continue.
         self._begin_seek_settle(resume=resume)
 
     def _begin_seek_settle(self, *, resume: bool) -> None:
-        # Small settle window so we don't get the "snap back then forward" feeling.
-        # Basically: “VLC, take a breath and decide where you actually landed.”
         self._seek_settle_resume = bool(resume)
 
         if self._seek_settle_timer is not None:
@@ -606,8 +603,7 @@ class MainWindow(QWidget):
         self._seek_settle_timer = QTimer(self)
         self._seek_settle_timer.setInterval(60)
 
-        # About 600ms is enough for VLC to land on MPD most of the time.
-        self._seek_settle_deadline_ms = 10  # just a counter of ticks
+        self._seek_settle_deadline_ms = 10
         self._seek_settle_timer.timeout.connect(self._seek_settle_tick)
         self._seek_settle_timer.start()
 
@@ -618,17 +614,14 @@ class MainWindow(QWidget):
         if landed is None or landed < 0:
             landed = 0
 
-        # Update the UI to the real landed time so the preview matches what you're seeing.
         self._seek_target_ms = int(landed)
 
-        # Stop settling once we've done a few ticks.
         if self._seek_settle_deadline_ms <= 0:
             try:
                 self._seek_settle_timer.stop()
             except Exception:
                 pass
 
-            # Resume/pause based on what we were doing before the seek.
             if self._seek_settle_resume:
                 try:
                     self._vlc_player.play()
@@ -641,7 +634,6 @@ class MainWindow(QWidget):
             self._clear_seek_guard_soon()
 
     def _clear_seek_guard_soon(self) -> None:
-        # Tiny delay so the UI doesn't flicker between old and new times.
         if self._seek_clear_timer is not None:
             try:
                 self._seek_clear_timer.stop()
@@ -652,7 +644,6 @@ class MainWindow(QWidget):
         self._seek_clear_timer.setSingleShot(True)
 
         def clear() -> None:
-            # After this, _on_tick goes back to being the “source of truth”.
             self._seeking = False
             self._seek_target_ms = None
 
@@ -660,20 +651,15 @@ class MainWindow(QWidget):
         self._seek_clear_timer.start(200)
 
     def _slider_value_to_ms(self, value: int) -> Optional[int]:
-        # Slider is 0..10_000, so we convert that to a ratio of the total duration.
         if self._total_ms <= 0:
             return None
         ratio = value / float(self.seek.maximum())
         return int(ratio * self._total_ms)
 
     def _restart_and_seek(self, target_ms: int, *, autoplay: bool) -> None:
-        # VLC can get stuck after EOF. We re-arm the player and seek to the target.
-        # This is the “revive VLC” routine:
-        # stop -> play -> seek -> (optional) resume.
         self._seek_after_restart_ms = max(0, int(target_ms))
         self._resume_after_seek = bool(autoplay)
 
-        # Keep the UI steady while VLC wakes up.
         self._seeking = True
         self._seek_target_ms = int(self._seek_after_restart_ms)
         self.time_lbl.setText(f"{_format_time(self._seek_target_ms)} / {_format_time(self._total_ms)}")
@@ -690,10 +676,11 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
-        self.stop_btn.setEnabled(True)
+        # Re-apply volume after restart because VLC can be weird about audio state.
+        self._apply_volume_to_vlc()
+
         self.play_btn.setText("Play")
 
-        # We try a few times because right after restart VLC sometimes ignores the first seek.
         self._restart_seek_attempts = 0
         QTimer.singleShot(30, self._finish_restart_seek)
 
@@ -716,14 +703,12 @@ class MainWindow(QWidget):
 
         self._restart_seek_attempts = getattr(self, "_restart_seek_attempts", 0) + 1
 
-        # If VLC didn’t accept it yet, try again a few times.
         if not ok and self._restart_seek_attempts < 6:
             QTimer.singleShot(40, self._finish_restart_seek)
             return
 
         self._seek_after_restart_ms = None
 
-        # Autoplay if requested, otherwise pause and wait.
         if self._resume_after_seek:
             try:
                 self._vlc_player.play()
@@ -737,11 +722,9 @@ class MainWindow(QWidget):
                 pass
             self.play_btn.setText("Play")
 
-        # Let it settle quickly so the UI reflects the real landed time.
         self._begin_seek_settle(resume=self._resume_after_seek)
 
     def _on_vlc_end_reached(self, event) -> None:
-        # VLC says “we’re done”. This is the reliable end marker.
         self._reached_end = True
         self.play_btn.setText("Play")
 
@@ -749,10 +732,48 @@ class MainWindow(QWidget):
             self.time_lbl.setText(f"{_format_time(self._total_ms)} / {_format_time(self._total_ms)}")
 
     def _on_vlc_error(self, event) -> None:
-        # Not ideal, but at least we can recover gracefully.
         self._reached_end = True
         self.play_btn.setText("Play")
         self._log("VLC hit a playback error. You can hit Play to restart or scrub and it will recover.")
+
+    def _apply_volume_to_vlc(self) -> None:
+        # VLC volume is 0..100, so this is a nice boring direct mapping.
+        try:
+            vol = int(self.volume.value())
+            self._vlc_player.audio_set_volume(vol)
+        except Exception:
+            pass
+
+        # Using slider==0 as "muted" keeps behaviour simple.
+        try:
+            self._vlc_player.audio_set_mute(self.volume.value() == 0)
+        except Exception:
+            pass
+
+        self._refresh_volume_icon()
+
+    def _refresh_volume_icon(self) -> None:
+        # Standard Qt icons so it looks normal on Windows/Mac/Linux.
+        if self.volume.value() == 0:
+            icon = self.style().standardIcon(QStyle.SP_MediaVolumeMuted)
+        else:
+            icon = self.style().standardIcon(QStyle.SP_MediaVolume)
+        self.mute_btn.setIcon(icon)
+
+    def _on_volume_changed(self, value: int) -> None:
+        # If the user drags volume up, I treat that as “unmute”.
+        if value > 0:
+            self._last_nonzero_volume = int(value)
+
+        self._apply_volume_to_vlc()
+
+    def _toggle_mute(self) -> None:
+        # Mute sets slider to 0, unmute restores the last non-zero volume.
+        if self.volume.value() == 0:
+            self.volume.setValue(max(1, int(self._last_nonzero_volume or 100)))
+        else:
+            self._last_nonzero_volume = int(self.volume.value())
+            self.volume.setValue(0)
 
     def _set_trim_in(self) -> None:
         t = self._vlc_player.get_time()
@@ -813,7 +834,6 @@ class MainWindow(QWidget):
             sig = inspect.signature(export_session)
             kwargs: Dict[str, Any] = {"overwrite": False}
 
-            # Soft-compat with exporter.py: only pass args if it supports them.
             if "start_time" in sig.parameters:
                 kwargs["start_time"] = trim_start_s
             if "end_time" in sig.parameters:
@@ -864,8 +884,6 @@ class MainWindow(QWidget):
 
         stats = self._ffprobe_json(ffprobe, mpd_path)
         if stats is None:
-            # If MPD probing fails, probe any real segment file.
-            # This usually gives correct codec/resolution/audio info.
             seg = self._find_any_segment(mpd_path.parent)
             if seg:
                 stats = self._ffprobe_json(ffprobe, seg)
