@@ -7,11 +7,11 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import vlc
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 
 from .scan import discover_sessions, find_sessions, RecordingSession
 from .exporter import export_session, ExportError
+from .steam_titles import build_steam_appid_title_map_with_cache
 
 
 @dataclass
@@ -49,15 +50,15 @@ class MediaStats:
 
     def has_audio(self) -> Optional[bool]:
         # Slightly goofy helper, but it keeps the call sites readable:
-        # None means “I genuinely don’t know yet”
-        # True means “audio stream exists”
+        # None means "I genuinely don't know yet"
+        # True means "audio stream exists"
         if self.acodec is None:
             return None
         return True
 
 
 def _format_time(ms: int) -> str:
-    # Defensive: VLC sometimes gives -1 for time when it’s starting/stopping.
+    # Defensive: VLC sometimes gives -1 for time when it's starting/stopping.
     if ms < 0:
         ms = 0
     total_s = ms // 1000
@@ -88,8 +89,8 @@ class MainWindow(QWidget):
         self.setWindowTitle("Steam Recording Salvage")
 
         # A bit of caching helps with MPD + segments (especially near the end).
-        # This is best-effort, and it doesn’t break anything if VLC ignores it.
-        # Also: no-video-title-show removes that random “filename” overlay VLC can do.
+        # This is best-effort, and it doesn't break anything if VLC ignores it.
+        # Also: no-video-title-show removes that random "filename" overlay VLC can do.
         self._vlc_instance = vlc.Instance(
             "--no-video-title-show",
             "--file-caching=2000",
@@ -98,7 +99,7 @@ class MainWindow(QWidget):
         self._vlc_player = self._vlc_instance.media_player_new()
 
         # Hook VLC events so we know when it REALLY ended (time math isn't reliable here).
-        # MPD playback can “look ended” without time==length, so this is the reliable signal.
+        # MPD playback can "look ended" without time==length, so this is the reliable signal.
         self._vlc_events = self._vlc_player.event_manager()
         self._vlc_events.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_vlc_end_reached)
         self._vlc_events.event_attach(vlc.EventType.MediaPlayerEncounteredError, self._on_vlc_error)
@@ -106,15 +107,15 @@ class MainWindow(QWidget):
         self._current_session: Optional[RecordingSession] = None
         self._current_stats: MediaStats = MediaStats()
 
-        # Scrub state: while you're dragging the slider, we treat it like “preview mode”
-        # and we don’t let the timer yank the slider around.
+        # Scrub state: while you're dragging the slider, we treat it like "preview mode"
+        # and we don't let the timer yank the slider around.
         self._is_scrubbing = False
         self._pending_seek_ms: Optional[int] = None
 
         # Total duration cache (ms). VLC can be a little slow to provide it for MPDs.
         self._total_ms: int = 0
 
-        # Tiny cache so we don’t re-run ffprobe if you re-select the same item.
+        # Tiny cache so we don't re-run ffprobe if you re-select the same item.
         self._last_stats_key: Optional[str] = None
 
         # Trim range in milliseconds (export converts to seconds later).
@@ -136,32 +137,44 @@ class MainWindow(QWidget):
         self._was_playing_before_scrub = False
 
         # Guard so the UI doesn't fight the seek while VLC is landing.
-        # Without this, _on_tick can overwrite the label/slider while we’re mid-seek.
+        # Without this, _on_tick can overwrite the label/slider while we're mid-seek.
         self._seeking = False
         self._seek_target_ms: Optional[int] = None
         self._seek_clear_timer: Optional[QTimer] = None
 
         # Seek settling tries (MPD seeks land on keyframes/segment boundaries sometimes).
-        # So we “settle” for a few ticks, then accept whatever time VLC actually landed on.
+        # So we "settle" for a few ticks, then accept whatever time VLC actually landed on.
         self._seek_settle_timer: Optional[QTimer] = None
         self._seek_settle_deadline_ms: int = 0  # not real milliseconds, just a tick counter
         self._seek_settle_resume: bool = False
 
+        # Cache of Steam AppID -> title, built from local Steam files.
+        # I keep this around so we don't keep hammering disk every time we refresh the list.
+        self._appid_to_title: Dict[int, str] = {}
+
+        # If we can't resolve a title, I still want grouping to work.
+        # So we show a fallback label instead of just dumping numeric IDs everywhere.
+        self._unknown_title_prefix = "Steam App"
+
         self.root_edit = QLineEdit()
         self.browse_root_btn = QPushButton("Browse…")
+
+        # This label sits above the sessions list.
+        # I like it because it gives context when you're pointed at a userdata folder.
+        self.sessions_title_lbl = QLabel("Sessions found")
 
         self.sessions_list = QListWidget()
 
         self.video_frame = QFrame()
         self.video_frame.setFrameShape(QFrame.StyledPanel)
         self.video_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.video_frame.setMinimumHeight(420)  # I like the preview feeling “taller”
+        self.video_frame.setMinimumHeight(420)  # I like the preview feeling "taller"
 
         self.play_btn = QPushButton("Play")
 
         # Stop button ended up feeling kind of pointless here.
         # We already have Play/Pause, scrubbing, and session switching resets playback anyway.
-        # So I’m swapping Stop for volume controls like a normal media player.
+        # So I'm swapping Stop for volume controls like a normal media player.
         self.mute_btn = QPushButton()
         self.mute_btn.setToolTip("Mute / unmute")
 
@@ -217,7 +230,7 @@ class MainWindow(QWidget):
         self._refresh_sessions()
 
         # One timer loop to keep UI in sync with VLC.
-        # We keep it smooth, but not “spammy”.
+        # We keep it smooth, but not "spammy".
         self._tick = QTimer(self)
         self._tick.setInterval(120)
         self._tick.timeout.connect(self._on_tick)
@@ -260,8 +273,54 @@ class MainWindow(QWidget):
         super().showEvent(event)
 
         # Lock the minimum size to whatever we open at.
-        # So users can’t shrink it into a broken layout.
+        # So users can't shrink it into a broken layout.
         self.setMinimumSize(self.size())
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Clean up VLC resources when window closes."""
+        try:
+            # Stop all timers
+            if self._tick and self._tick.isActive():
+                self._tick.stop()
+            
+            if self._seek_settle_timer and self._seek_settle_timer.isActive():
+                self._seek_settle_timer.stop()
+                
+            if self._seek_clear_timer and self._seek_clear_timer.isActive():
+                self._seek_clear_timer.stop()
+            
+            # Release VLC player
+            if self._vlc_player:
+                try:
+                    self._vlc_player.stop()
+                except Exception:
+                    pass
+                
+                # Detach events
+                if self._vlc_events:
+                    try:
+                        self._vlc_events.event_detach(vlc.EventType.MediaPlayerEndReached)
+                        self._vlc_events.event_detach(vlc.EventType.MediaPlayerEncounteredError)
+                    except Exception:
+                        pass
+                    
+                try:
+                    self._vlc_player.release()
+                except Exception:
+                    pass
+            
+            # Release VLC instance
+            if self._vlc_instance:
+                try:
+                    self._vlc_instance.release()
+                except Exception:
+                    pass
+                    
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
+        
+        finally:
+            event.accept()
 
     def _build_layout(self) -> None:
         root_row = QHBoxLayout()
@@ -275,7 +334,7 @@ class MainWindow(QWidget):
         out_row.addWidget(self.browse_out_btn)
 
         left_col = QVBoxLayout()
-        left_col.addWidget(QLabel("Sessions found"))
+        left_col.addWidget(self.sessions_title_lbl)
         left_col.addWidget(self.sessions_list, 1)
 
         stats_box = QFrame()
@@ -382,13 +441,38 @@ class MainWindow(QWidget):
         if folder:
             self.out_edit.setText(folder)
 
+    def _extract_appid_from_session(self, s: RecordingSession) -> Optional[int]:
+        # Steam sessions live under a folder name like: bg_<appid>_<timestamp>...
+        # Example: bg_1903340_20260101_012808
+        # So I just yank out the middle number and call it a day.
+        try:
+            folder = s.mpd_path.parent.name
+            parts = folder.split("_")
+            if len(parts) >= 2 and parts[0] in {"bg", "fg"}:
+                return int(parts[1])
+        except Exception:
+            pass
+        return None
+
+    def _ensure_steam_titles_loaded(self) -> None:
+        # This tries to resolve AppIDs to titles using local Steam install data.
+        # If it fails, no big deal, we still show AppIDs as a fallback.
+        if self._appid_to_title:
+            return
+
+        try:
+            res = build_steam_appid_title_map_with_cache()
+            self._appid_to_title = dict(res.appid_to_title)
+        except Exception:
+            self._appid_to_title = {}
+
     def _refresh_sessions(self) -> None:
         self.sessions_list.clear()
         self._current_session = None
         self.export_btn.setEnabled(False)
         self.play_btn.setEnabled(False)
 
-        # When switching roots, we’re basically resetting the whole player state.
+        # When switching roots, we're basically resetting the whole player state.
         self._stop_preview()
         self._clear_trim()
         self._set_stats(MediaStats())
@@ -397,13 +481,75 @@ class MainWindow(QWidget):
         sessions = find_sessions(root) if root.exists() else []
 
         if not sessions:
+            self.sessions_title_lbl.setText("Sessions found")
             self._log(f"No sessions found under: {root}")
             return
 
+        # Load titles once per app run (best-effort). If this fails, we just show AppIDs.
+        self._ensure_steam_titles_loaded()
+
+        # Group sessions by AppID so each game gets its own header section.
+        grouped: Dict[int, List[RecordingSession]] = {}
+        unknown_bucket: List[RecordingSession] = []
+
         for s in sessions:
-            item = QListWidgetItem(s.mpd_path.as_posix())
-            item.setData(Qt.UserRole, s)
-            self.sessions_list.addItem(item)
+            appid = self._extract_appid_from_session(s)
+            if appid is None:
+                # If Steam changes formats or something weird happens, I don't want the whole UI to die.
+                unknown_bucket.append(s)
+                continue
+            grouped.setdefault(appid, []).append(s)
+
+        # Keep the label generic because we're showing multiple games.
+        self.sessions_title_lbl.setText(f"Sessions found ({len(sessions)})")
+
+        # Sort games by title (nice and readable), falling back to AppID string.
+        def game_sort_key(appid: int) -> str:
+            title = self._appid_to_title.get(appid)
+            if title:
+                return title.casefold()
+            return f"{appid:010d}"
+
+        for appid in sorted(grouped.keys(), key=game_sort_key):
+            title = self._appid_to_title.get(appid) or f"{self._unknown_title_prefix} {appid}"
+
+            # Header row. I make this non-selectable so you can't accidentally "play" a header.
+            header = QListWidgetItem(title)
+            header.setFlags(header.flags() & ~Qt.ItemIsSelectable)
+
+            # I want headers to visually read like sections, not like clickable items.
+            f = header.font()
+            f.setBold(True)
+            header.setFont(f)
+
+            self.sessions_list.addItem(header)
+
+            # Add the sessions under that header.
+            # I indent them so it feels like a hierarchy, without needing a whole tree widget.
+            for s in sorted(grouped[appid], key=lambda x: x.mpd_path.as_posix()):
+                # I only want the list to show the "human" part:
+                # bg_1903340_.../session.mpd instead of the full C:/Program Files/... monster path.
+                pretty = f"{s.mpd_path.parent.name}/{s.mpd_path.name}"
+                row = QListWidgetItem(f"    {pretty}")
+                row.setData(Qt.UserRole, s)
+                self.sessions_list.addItem(row)
+
+        # If we couldn't parse AppID for some sessions, dump them at the end.
+        if unknown_bucket:
+            header = QListWidgetItem("Other recordings (unmatched)")
+            header.setFlags(header.flags() & ~Qt.ItemIsSelectable)
+
+            f = header.font()
+            f.setBold(True)
+            header.setFont(f)
+
+            self.sessions_list.addItem(header)
+
+            for s in sorted(unknown_bucket, key=lambda x: x.mpd_path.as_posix()):
+                pretty = f"{s.mpd_path.parent.name}/{s.mpd_path.name}"
+                row = QListWidgetItem(f"    {pretty}")
+                row.setData(Qt.UserRole, s)
+                self.sessions_list.addItem(row)
 
         self._log(f"Found {len(sessions)} session(s). Select one to preview or export.")
 
@@ -415,11 +561,18 @@ class MainWindow(QWidget):
             self.play_btn.setEnabled(False)
             return
 
-        self._current_session = item.data(Qt.UserRole)
+        session = item.data(Qt.UserRole)
+
+        # If you clicked a header row, there's no session attached, so we just do nothing.
+        if session is None:
+            self.sessions_list.clearSelection()
+            return
+
+        self._current_session = session
         self.export_btn.setEnabled(True)
         self.play_btn.setEnabled(True)
 
-        # Reset trim on new selection so you don’t accidentally export the wrong range.
+        # Reset trim on new selection so you don't accidentally export the wrong range.
         self._clear_trim()
 
         # New video = fresh end-state.
@@ -432,7 +585,7 @@ class MainWindow(QWidget):
         self._read_stats_for_current()
 
     def _attach_vlc_to_widget(self) -> None:
-        # VLC needs the native window handle, and it’s different per OS.
+        # VLC needs the native window handle, and it's different per OS.
         wid = int(self.video_frame.winId())
 
         if sys.platform.startswith("win"):
@@ -761,7 +914,7 @@ class MainWindow(QWidget):
         self.mute_btn.setIcon(icon)
 
     def _on_volume_changed(self, value: int) -> None:
-        # If the user drags volume up, I treat that as “unmute”.
+        # If the user drags volume up, I treat that as "unmute".
         if value > 0:
             self._last_nonzero_volume = int(value)
 
@@ -808,7 +961,10 @@ class MainWindow(QWidget):
         if not item:
             return
 
-        session: RecordingSession = item.data(Qt.UserRole)
+        session: Optional[RecordingSession] = item.data(Qt.UserRole)
+        if session is None:
+            return
+
         out_dir = Path(self.out_edit.text()).expanduser().resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -853,7 +1009,7 @@ class MainWindow(QWidget):
             if (trim_start_s is not None or trim_end_s is not None) and (
                 "start_time" not in sig.parameters and "end_time" not in sig.parameters
             ):
-                self._log("Export finished, but exporter.py doesn’t accept trim args yet, so it exported full length.")
+                self._log("Export finished, but exporter.py doesn't accept trim args yet, so it exported full length.")
 
             self._log("Done.")
         except ExportError as e:
